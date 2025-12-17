@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""
+Clean Multi-Agent Environment
+Final obs dim per agent = 9
+"""
+
+import gymnasium as gym
+import numpy as np
+from src.coordination import Coordinator
+from src.env_navigation_real import NavigationEnvReal
+from src.env_navigation import NavigationEnv
+from src.env_navigation_real import NavigationEnvReal
+from src.env_from_states import EnvFromStates
+
+
+class MultiAgentEnv(gym.Env):
+
+    def __init__(self):
+        super().__init__()
+
+        # Two real nav envs
+        self.agent1 = NavigationEnvReal(
+            poses_path="data/kitti/poses/00.txt",
+            tracks_path="experiments/yolo/kitti_00/reconstruction/tracking/tracks_master.csv",
+            fps=10.0,
+            start_frame=0,
+            max_frames=2000
+        )
+
+        self.agent2 = NavigationEnvReal(
+            poses_path="data/kitti/poses/00.txt",
+            tracks_path="experiments/yolo/kitti_00/reconstruction/tracking/tracks_master.csv",
+            fps=10.0,
+            start_frame=0,
+            max_frames=2000
+        )
+
+        # Coordinator
+        self.coordinator = Coordinator(n_agents=2, neighbor_radius=6.0, logger=None)
+
+        # Final observation dim = 6 base + 1 leader flag + 2 comm
+        low = np.full(9, -np.inf)
+        high = np.full(9, np.inf)
+
+        self.observation_space = gym.spaces.Tuple((
+            gym.spaces.Box(low=low, high=high, dtype=np.float32),
+            gym.spaces.Box(low=low, high=high, dtype=np.float32),
+        ))
+
+        # Action space
+        self.action_space = gym.spaces.Tuple((
+            gym.spaces.Discrete(5),
+            gym.spaces.Discrete(5),
+        ))
+
+        self.done = False
+
+    # ----------------------------------------------------
+    def _augment(self, base_obs, leader):
+        """Add: [leader_flag, comm0, comm1]"""
+        base = np.array(base_obs, dtype=float)
+        leader_flag = np.array([float(leader)], dtype=float)
+        comm = np.array([1.0 if leader == 0 else 0.0,
+                         1.0 if leader == 1 else 0.0], dtype=float)
+        return np.concatenate([base, leader_flag, comm])
+
+    # ----------------------------------------------------
+    def reset(self):
+        o1 = np.array(self.agent1.reset(), dtype=float)
+        o2 = np.array(self.agent2.reset(), dtype=float)
+
+        # Update coordinator poses
+        pos0 = getattr(self.agent1, "pos_xy", (0.0, 0.0))
+        pos1 = getattr(self.agent2, "pos_xy", (1.0, 0.0))
+        self.coordinator.update_agent_pose(0, pos0)
+        self.coordinator.update_agent_pose(1, pos1)
+
+        # Create 1 task + assign leader
+        task_pos = (float(np.random.uniform(-20, 20)),
+                    float(np.random.uniform(-10, 10)))
+        task_id = self.coordinator.create_task(task_pos)
+        leader = self.coordinator.assign_best_agent(task_id)
+        self.current_leader = leader
+
+        return (self._augment(o1, leader),
+                self._augment(o2, leader))
+
+    # ----------------------------------------------------
+    def step(self, actions):
+        a0, a1 = actions
+
+        o1, r1, d1, _ = self.agent1.step(a0)
+        o2, r2, d2, _ = self.agent2.step(a1)
+
+        o1 = np.array(o1, dtype=float)
+        o2 = np.array(o2, dtype=float)
+
+        self.done = d1 or d2
+
+        # Update coordinator poses
+        pos0 = getattr(self.agent1, "pos_xy", (0.0, 0.0))
+        pos1 = getattr(self.agent2, "pos_xy", (1.0, 0.0))
+        self.coordinator.update_agent_pose(0, pos0)
+        self.coordinator.update_agent_pose(1, pos1)
+
+        # Cooperative reward
+        risk1, risk2 = o1[5], o2[5]
+        coop_reward = (r1 + r2) - 0.3 * (risk1 + risk2)
+
+        # Augment obs
+        o1 = self._augment(o1, self.current_leader)
+        o2 = self._augment(o2, self.current_leader)
+
+        return (o1, o2), coop_reward, self.done, {}
+
